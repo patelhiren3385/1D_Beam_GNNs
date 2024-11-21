@@ -1,0 +1,233 @@
+
+import numpy as np
+import torch
+from scipy.linalg import eigh
+from torch_geometric.data import Data, Dataset
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+from itertools import combinations
+# Generate synthetic dataset by varying E (Young's Modulus) and I (Moment of Inertia)
+L = 3.0            # Beam length
+rho = 7800         # Density
+A = 0.01           # Cross-sectional area
+num_elements = 10   # Changes here will change the number of nodes and edges in Graph
+element_length = L / num_elements
+E_values = np.linspace(1e9, 3e9, 10)
+I_values = np.linspace(5e-7, 2e-6, 10)
+synthetic_data = []
+for E in E_values:
+   for I in I_values:
+       def beam_element_stiffness(E, I, L_e):
+           return (E * I / L_e**3) * np.array([
+               [12, 6*L_e, -12, 6*L_e],
+               [6*L_e, 4*L_e**2, -6*L_e, 2*L_e**2],
+               [-12, -6*L_e, 12, -6*L_e],
+               [6*L_e, 2*L_e**2, -6*L_e, 4*L_e**2]
+           ])
+       def beam_element_mass(rho, A, L_e):
+           return (rho * A * L_e / 420) * np.array([
+               [156, 22*L_e, 54, -13*L_e],
+               [22*L_e, 4*L_e**2, 13*L_e, -3*L_e**2],
+               [54, 13*L_e, 156, -22*L_e],
+               [-13*L_e, -3*L_e**2, -22*L_e, 4*L_e**2]
+           ])
+       K_global = np.zeros((2 * (num_elements + 1), 2 * (num_elements + 1)))
+       M_global = np.zeros((2 * (num_elements + 1), 2 * (num_elements + 1)))
+       for i in range(num_elements):
+           K_e = beam_element_stiffness(E, I, element_length)
+           M_e = beam_element_mass(rho, A, element_length)
+           DOF_map = [2*i, 2*i+1, 2*i+2, 2*i+3]
+           for a in range(4):
+               for b in range(4):
+                   K_global[DOF_map[a], DOF_map[b]] += K_e[a, b]
+                   M_global[DOF_map[a], DOF_map[b]] += M_e[a, b]
+       K_reduced = K_global[2:, 2:]
+       M_reduced = M_global[2:, 2:]
+       eigenvalues, eigenvectors = eigh(K_reduced, K_reduced)
+       frequencies = np.sqrt(eigenvalues) / (2 * np.pi)
+       common_scale = (np.linalg.norm(M_reduced, 'fro') + np.linalg.norm(K_reduced, 'fro')) / 2
+       # Scale both M and K using the common scaling factor
+       M_scaled_consistent = M_reduced / common_scale
+       K_scaled_consistent = K_reduced / common_scale
+       synthetic_data.append({
+           "E": E,
+           "I": I,
+           "frequencies": frequencies[:2],
+           "mode_shapes": eigenvectors[:, :2],
+           "M_reduced": M_scaled_consistent,
+           "K_reduced": K_scaled_consistent
+       })
+# Define Dataset class
+class BeamDataset(Dataset):
+   def __init__(self, synthetic_data, min_frequency, max_frequency):
+       super(BeamDataset, self).__init__()
+       self.synthetic_data = synthetic_data
+       # Normalize both frequencies and mode shapes in the Dataset class
+       for sample in synthetic_data:
+            # Normalize frequencies (only for training, these will be denormalized at the end if needed)
+            sample["frequencies"] = (sample["frequencies"][:2] - min_frequency) / (max_frequency - min_frequency)
+            # Normalize mode shapes
+       for i in range(sample["mode_shapes"].shape[1]):  # Loop over each mode shape
+            mode_norm = np.linalg.norm(sample["mode_shapes"][:, i])
+            if mode_norm > 0:
+                sample["mode_shapes"][:, i] /= mode_norm
+
+   def len(self):
+       return len(self.synthetic_data)
+   def get(self, idx):
+       sample = self.synthetic_data[idx]
+       E, I = sample["E"], sample["I"]
+       frequencies, mode_shapes = sample["frequencies"], sample["mode_shapes"]
+       def beam_element_stiffness(E, I, L_e):
+           return (E * I / L_e**3) * np.array([
+               [12, 6*L_e, -12, 6*L_e],
+               [6*L_e, 4*L_e**2, -6*L_e, 2*L_e**2],
+               [-12, -6*L_e, 12, -6*L_e],
+               [6*L_e, 2*L_e**2, -6*L_e, 4*L_e**2]
+           ])
+       def beam_element_mass(rho, A, L_e):
+           return (rho * A * L_e / 420) * np.array([
+               [156, 22*L_e, 54, -13*L_e],
+               [22*L_e, 4*L_e**2, 13*L_e, -3*L_e**2],
+               [54, 13*L_e, 156, -22*L_e],
+               [-13*L_e, -3*L_e**2, -22*L_e, 4*L_e**2]
+           ])
+       K_global = np.zeros((2 * (num_elements + 1), 2 * (num_elements + 1)))
+       M_global = np.zeros((2 * (num_elements + 1), 2 * (num_elements + 1)))
+       for i in range(num_elements):
+           K_e = beam_element_stiffness(E, I, element_length)
+           M_e = beam_element_mass(rho, A, element_length)
+           DOF_map = [2*i, 2*i+1, 2*i+2, 2*i+3]
+           for a in range(4):
+               for b in range(4):
+                   K_global[DOF_map[a], DOF_map[b]] += K_e[a, b]
+                   M_global[DOF_map[a], DOF_map[b]] += M_e[a, b]
+       K_reduced = K_global[2:, 2:]
+       M_reduced = M_global[2:, 2:]
+       node_features = np.column_stack((np.diag(K_reduced), np.diag(M_reduced)))
+       node_features = torch.tensor(node_features, dtype=torch.float)
+       edge_index = []
+       edge_features = []
+       for i, j in combinations(range(K_reduced.shape[0]), 2):
+           if K_reduced[i, j] != 0 or M_reduced[i, j] != 0:
+               edge_index.append([i, j])
+               edge_index.append([j, i])
+               edge_features.append([K_reduced[i, j], M_reduced[i, j]])
+               edge_features.append([K_reduced[j, i], M_reduced[j, i]])
+       edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+       edge_features = torch.tensor(edge_features, dtype=torch.float)
+       target_frequencies = torch.tensor(frequencies, dtype=torch.float)
+       target_mode_shapes = torch.tensor(mode_shapes, dtype=torch.float)
+       # Assuming M_reduced and K_reduced are available for each sample
+       M_reduced = torch.tensor(sample["M_reduced"], dtype=torch.float)
+       K_reduced = torch.tensor(sample["K_reduced"], dtype=torch.float)
+       graph_data = Data(
+           x=node_features,
+           edge_index=edge_index,
+           edge_attr=edge_features,
+           y_frequencies=target_frequencies,
+           y_mode_shapes=target_mode_shapes, 
+           M_reduced = M_reduced,
+           K_reduced = K_reduced
+       )
+       return graph_data
+# Calculate min and max frequencies from synthetic data for normalization
+all_frequencies = np.concatenate([sample["frequencies"][:2] for sample in synthetic_data])
+min_frequency = all_frequencies.min()
+max_frequency = all_frequencies.max()
+# Create dataset instance with normalization
+beam_dataset = BeamDataset(synthetic_data, min_frequency, max_frequency)
+# 80-20 train-test split
+train_indices, test_indices = train_test_split(range(len(beam_dataset)), test_size=0.2, random_state=42)
+train_dataset = [beam_dataset[i] for i in train_indices]
+test_dataset = [beam_dataset[i] for i in test_indices]
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False)
+# Define GNN model
+class FrequencyModeGNN(torch.nn.Module):
+   def __init__(self, hidden_channels, num_modes):
+       super(FrequencyModeGNN, self).__init__()
+       self.conv1 = GCNConv(2, hidden_channels)
+       self.conv2 = GCNConv(hidden_channels, hidden_channels)
+       self.conv3 = GCNConv(hidden_channels, hidden_channels)
+       self.fc_freq = torch.nn.Linear(hidden_channels, num_modes)
+       self.fc_mode = torch.nn.Linear(hidden_channels, num_modes * 6) # 6 Dofs
+   def forward(self, x, edge_index, edge_attr, batch):
+       x = self.conv1(x, edge_index, edge_weight=edge_attr[:, 0])
+       x = F.relu(x)
+       x = self.conv2(x, edge_index, edge_weight=edge_attr[:, 0])
+       x = F.relu(x)
+       x = self.conv3(x, edge_index, edge_weight=edge_attr[:, 0])
+       x = global_mean_pool(x, batch)
+       frequencies = self.fc_freq(x)
+       mode_shapes = self.fc_mode(x).reshape(-1, 6, 2) # 6 DOFs and 2 Mode shapes
+       return frequencies, mode_shapes
+model = FrequencyModeGNN(hidden_channels=16, num_modes=2)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.000001)
+# Define the custom physics-based loss function
+def physics_loss(pred_frequencies, pred_mode_shapes, M, K):
+   # Compute omega^2 as pred_frequencies squared
+   omega_squared = pred_frequencies ** 2
+   # Initialize physics residual loss
+   physics_residual = 0
+   # Loop over each mode and compute (M - omega^2 K) * phi
+   for i in range(omega_squared.shape[1]):  # Loop over the number of predicted modes
+       residual = M @ pred_mode_shapes[:, :, i] - omega_squared[:, i].unsqueeze(1) * (K @ pred_mode_shapes[:, :, i])
+       physics_residual += torch.norm(residual, p=2) ** 2  # Sum of squared residuals
+   return physics_residual / omega_squared.shape[1]  # Normalize by the number of modes
+
+# Redefine the combined loss function with physics-based loss disabled initially
+def combined_loss_function(pred_frequencies, pred_mode_shapes, target_frequencies, target_mode_shapes, M, K, alpha=0.0):
+   # Prediction losses
+   freq_loss = F.mse_loss(pred_frequencies, target_frequencies)
+   mode_loss = F.mse_loss(pred_mode_shapes, target_mode_shapes)
+   # Physics-based loss
+   omega_squared = pred_frequencies ** 2
+   physics_residual = 0
+   for i in range(omega_squared.shape[1]):
+       residual = M @ pred_mode_shapes[:, :, i] - omega_squared[:, i].unsqueeze(1) * (K @ pred_mode_shapes[:, :, i])
+       physics_residual += torch.norm(residual, p=2) ** 2
+   physics_residual /= omega_squared.shape[1]
+   return freq_loss + mode_loss + alpha * physics_residual
+# Training loop with debugging and gradual physics-based loss introduction
+num_epochs = 10
+alpha = 0.0  # Start with no physics-based loss, increase later
+model.train()
+for epoch in range(num_epochs):
+   total_loss = 0
+   for data in train_loader:
+       optimizer.zero_grad()
+       # Forward pass with debugging
+       pred_frequencies, pred_mode_shapes = model(data.x, data.edge_index, data.edge_attr, data.batch)
+       # Debug: Check for NaNs in the predictions
+       if torch.isnan(pred_frequencies).any() or torch.isnan(pred_mode_shapes).any():
+           print("NaN detected in model predictions at epoch:", epoch)
+           print("Predicted Frequencies:", pred_frequencies)
+           print("Predicted Mode Shapes:", pred_mode_shapes)
+           continue  # Skip this batch to prevent propagation of NaNs
+       # Compute the combined loss
+       loss = combined_loss_function(
+           pred_frequencies, pred_mode_shapes,
+           data.y_frequencies, data.y_mode_shapes,
+           data.M_reduced, data.K_reduced, alpha=alpha
+       )
+       # Debug: Check for NaNs in the loss
+       if torch.isnan(loss):
+           print("NaN detected in loss at epoch:", epoch)
+           print("Frequencies:", data.y_frequencies)
+           print("Mode Shapes:", data.y_mode_shapes)
+           print("M_reduced:", data.M_reduced)
+           print("K_reduced:", data.K_reduced)
+           continue  # Skip this batch to prevent propagation of NaNs
+       # Backward pass with stronger gradient clipping
+       loss.backward()
+       torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)  # Further reduced max_norm
+       optimizer.step()
+       total_loss += loss.item()
+   # Gradually increase the physics-based loss weight
+   if epoch % 2 == 0 and alpha < 0.1:
+       alpha += 0.02  # Increase gradually
+   print(f'Epoch {epoch}, Loss: {total_loss / len(train_loader)}')
+
